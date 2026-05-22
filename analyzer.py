@@ -65,11 +65,16 @@ def analyze(
     results: list[str] = []
     for i, mxf_path in enumerate(mxf_paths, 1):
         _progress(f"Ekstrahuję audio ({i}/{len(mxf_paths)}): {mxf_path.name}…")
+        # If the recorded drive is unavailable, scan Avid MediaFiles on all drives.
         if not mxf_path.exists():
-            raise AnalysisError(
-                f"Nie znaleziono pliku mediów:\n{mxf_path}\n\n"
-                "Upewnij się, że dysk z materiałem jest podłączony i ścieżka jest dostępna."
-            )
+            found = _find_mxf_on_any_drive(mxf_path.name)
+            if found is None:
+                raise AnalysisError(
+                    f"Nie znaleziono pliku mediów:\n{mxf_path.name}\n\n"
+                    "Sprawdzono wszystkie dyski w folderach Avid MediaFiles\\MXF.\n"
+                    "Upewnij się, że dysk z materiałem jest podłączony."
+                )
+            mxf_path = found
         y, sr = _extract_audio(mxf_path)
 
         _progress(f"Wykrywam pauzy ({i}/{len(mxf_paths)}): {mxf_path.name}…")
@@ -84,23 +89,35 @@ def analyze(
 # ---------------------------------------------------------------------------
 
 def _resolve_mxf_paths(aaf_path: Path) -> list[Path]:
-    """Parse AAF and return a deduplicated ordered list of referenced MXF paths."""
+    """Parse AAF and return a deduplicated ordered list of referenced MXF audio paths.
+
+    Avid AAF locators are accessed via descriptor['Locator'].value (not descriptor.locators).
+    If the recorded drive letter is unavailable (e.g. media moved from F: to C:),
+    falls back to scanning all Avid MediaFiles folders on connected drives.
+    Only audio descriptors (PCMDescriptor) are processed; video (CDCIDescriptor)
+    and original-source references (ImportDescriptor) are skipped.
+    """
     paths: list[Path] = []
     try:
         with aaf2.open(str(aaf_path)) as f:
             for mob in f.content.mobs:
-                if not hasattr(mob, "descriptor"):
+                desc = getattr(mob, "descriptor", None)
+                if desc is None:
+                    continue
+                # Skip video and original-source descriptors — only want Avid MXF audio
+                if type(desc).__name__ != "PCMDescriptor":
                     continue
                 try:
-                    for locator in mob.descriptor.locators:
-                        url = _locator_url(locator)
-                        if not url:
-                            continue
-                        p = _url_to_path(url)
-                        if p and p.suffix.lower() == ".mxf":
-                            paths.append(p)
-                except Exception:
+                    locator_list = desc["Locator"].value
+                except (KeyError, AttributeError, TypeError):
                     continue
+                for locator in locator_list:
+                    url = _locator_url(locator)
+                    if not url:
+                        continue
+                    p = _url_to_path(url)
+                    if p and p.suffix.lower() == ".mxf":
+                        paths.append(p)
     except AnalysisError:
         raise
     except Exception as exc:
@@ -144,8 +161,31 @@ def _url_to_path(url: str) -> Path | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# Audio extraction
+def _find_mxf_on_any_drive(filename: str) -> Path | None:
+    """
+    Fallback: search for *filename* inside Avid MediaFiles\\MXF\\ on every
+    connected Windows drive (C:, D:, E: … Z:).
+
+    Avid always stores MXF files under <drive>\\Avid MediaFiles\\MXF\\<project>\\.
+    When media was recorded on a different machine or drive letter, the locator
+    path in the AAF will be wrong but the filename is still unique and stable.
+    """
+    import string
+    for letter in string.ascii_uppercase:
+        root = Path(f"{letter}:\\Avid MediaFiles\\MXF")
+        if not root.is_dir():
+            continue
+        # Walk one level deep (project subfolders)
+        for project_dir in root.iterdir():
+            if not project_dir.is_dir():
+                continue
+            candidate = project_dir / filename
+            if candidate.exists():
+                return candidate
+    return None
+
+
+
 # ---------------------------------------------------------------------------
 
 def _extract_audio(mxf_path: Path) -> tuple[np.ndarray, int]:
