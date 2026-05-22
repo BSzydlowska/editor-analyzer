@@ -12,6 +12,7 @@ from analyzer import (
     _detect_pauses,
     _format_pauses,
     _to_tc,
+    _to_tc_frames,
     _url_to_path,
 )
 
@@ -149,3 +150,52 @@ class TestFormatPauses:
         lines = _format_pauses(pauses)
         assert len(lines) == 2
         assert "00:01:00.000" in lines[1]
+
+
+# ---------------------------------------------------------------------------
+# _to_tc_frames — frame timecode formatting
+# ---------------------------------------------------------------------------
+
+class TestToTcFrames:
+    def test_zero(self) -> None:
+        assert _to_tc_frames(0.0, 25.0) == "00:00:00:00"
+
+    def test_one_second(self) -> None:
+        assert _to_tc_frames(1.0, 25.0) == "00:00:01:00"
+
+    def test_half_second_25fps(self) -> None:
+        # 0.5 s * 25 fps = 12.5 → floor = 12 frames
+        assert _to_tc_frames(0.5, 25.0) == "00:00:00:12"
+
+    def test_one_minute(self) -> None:
+        assert _to_tc_frames(60.0, 25.0) == "00:01:00:00"
+
+    def test_one_hour(self) -> None:
+        assert _to_tc_frames(3600.0, 25.0) == "01:00:00:00"
+
+    def test_frame_wraps_at_fps(self) -> None:
+        # 24 frames at 25fps = 0.96 s; next frame (25th) wraps to :01:00
+        assert _to_tc_frames(0.96, 25.0) == "00:00:00:24"
+        assert _to_tc_frames(1.0, 25.0) == "00:00:01:00"
+
+    def test_30fps(self) -> None:
+        assert _to_tc_frames(1.0, 30.0) == "00:00:01:00"
+        assert _to_tc_frames(0.5, 30.0) == "00:00:00:15"
+
+
+class TestFormatPausesWithFps:
+    def test_shows_frame_tc_when_fps_given(self) -> None:
+        lines = _format_pauses([(3.0, 7.5)], fps=25.0)
+        assert len(lines) == 1
+        # Frame TC: 3.0s → 00:00:03:00, 7.5s → 00:00:07:12
+        assert "00:00:03:00" in lines[0]
+        assert "00:00:07:12" in lines[0]
+        # Millisecond TC still present in brackets
+        assert "00:00:03.000" in lines[0]
+        assert "00:00:07.500" in lines[0]
+        assert "4.50 s" in lines[0]
+
+    def test_no_frame_tc_when_fps_zero(self) -> None:
+        lines = _format_pauses([(3.0, 7.5)], fps=0.0)
+        assert ":" in lines[0]
+        assert "00:00:03.000" in lines[0]
