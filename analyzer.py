@@ -29,11 +29,26 @@ import numpy as np
 _TARGET_SR = 16_000
 
 # Segments more than this many dB below the peak are treated as silent by librosa.
-_TOP_DB = 40
+# 40 dB is conservative — covers clear pauses without misclassifying soft speech.
+_TOP_DB = 30
+
+# Non-silent intervals closer than this (in seconds) are merged into one.
+# Prevents soft transitions, breathing, or slight energy dips within speech from
+# fragmenting genuine speech and creating fake short "pauses" between fragments.
+_MERGE_GAP_SEC = 0.2
 
 
 class AnalysisError(Exception):
     """Raised when analysis cannot proceed (bad file, missing media, etc.)."""
+
+
+@dataclass
+class AnalysisResult:
+    """Return value of analyze() — pause lines plus summary statistics."""
+    lines: list[str]
+    total_sec: float        # total sequence duration
+    pause_sec: float        # sum of all detected pauses
+    audio_sec: float        # total_sec - pause_sec
 
 
 @dataclass
@@ -47,15 +62,18 @@ class _ClipRef:
 def analyze(
     aaf_path: Path,
     threshold_sec: float,
+    top_db: int = _TOP_DB,
     on_progress: Callable[[str], None] | None = None,
-) -> list[str]:
+) -> AnalysisResult:
     """
-    Run the full pipeline and return formatted pause strings.
+    Run the full pipeline and return an AnalysisResult with pause lines and stats.
 
     Parameters
     ----------
     aaf_path:       Path to the .aaf project file.
     threshold_sec:  Minimum pause duration in seconds to report.
+    top_db:         dB threshold for silence detection (librosa top_db).
+                    Lower = less sensitive (only clear silences). Default 30.
     on_progress:    Optional callback called with a status string at each step.
                     Must be thread-safe (the UI calls self.after() inside it).
     """
@@ -73,8 +91,17 @@ def analyze(
         raise AnalysisError(f"Nie można przetworzyć pliku AAF: {exc}") from exc
 
     _progress("Wykrywam pauzy w sekwencji…")
-    pauses = _detect_pauses(y, sr, threshold_sec)
-    return _format_pauses(pauses, fps=fps)
+    pauses = _detect_pauses(y, sr, threshold_sec, top_db=top_db)
+    lines = _format_pauses(pauses, fps=fps)
+
+    total_sec = len(y) / sr
+    pause_sec = sum(end - start for start, end in pauses)
+    return AnalysisResult(
+        lines=lines,
+        total_sec=total_sec,
+        pause_sec=pause_sec,
+        audio_sec=total_sec - pause_sec,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -450,26 +477,43 @@ def _detect_pauses(
     y: np.ndarray,
     sr: int,
     threshold_sec: float,
+    top_db: int = _TOP_DB,
 ) -> list[tuple[float, float]]:
     """
     Detect silent gaps in y longer than threshold_sec.
 
-    Uses librosa.effects.split() which computes RMS energy per frame and
-    marks frames more than _TOP_DB dB below the signal peak as silent.
-    This captures quiet breathing and low hum — not just hard silence —
-    matching the energy-level rule in the PRD.
+    Algorithm:
+    1. librosa.effects.split() identifies non-silent intervals (RMS energy
+       above top_db dB relative to signal peak).
+    2. Non-silent intervals closer than _MERGE_GAP_SEC are merged — prevents
+       soft speech transitions or brief energy dips from fragmenting speech
+       into many small pieces and creating false short pauses between them.
+    3. Gaps between merged non-silent intervals longer than threshold_sec
+       are reported as pauses.
 
     Returns a list of (start_sec, end_sec) tuples.
     """
     if y.size == 0:
         return []
 
-    intervals = librosa.effects.split(y, top_db=_TOP_DB, frame_length=2048, hop_length=512)
+    raw_intervals = librosa.effects.split(y, top_db=top_db, frame_length=1024, hop_length=256)
+    if len(raw_intervals) == 0:
+        return []
+
+    # Merge non-silent intervals that are less than _MERGE_GAP_SEC apart.
+    merge_samples = int(_MERGE_GAP_SEC * sr)
+    merged: list[list[int]] = [list(raw_intervals[0])]
+    for start, end in raw_intervals[1:]:
+        if start - merged[-1][1] <= merge_samples:
+            merged[-1][1] = end   # extend current interval
+        else:
+            merged.append([start, end])
+
     total_samples = len(y)
     pauses: list[tuple[float, float]] = []
 
     prev_end = 0
-    for start, end in intervals:
+    for start, end in merged:
         gap_start = prev_end / sr
         gap_end = start / sr
         if gap_end - gap_start >= threshold_sec:
