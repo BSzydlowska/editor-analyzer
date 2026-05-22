@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Install dependencies
+        run: uv sync --all-groups
+
+      - name: Run tests
+        run: uv run pytest tests/ -v
+
+      - name: Build .exe
+        run: uv run pyinstaller editor_analyzer.spec
+
+      - name: Upload release asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/EditorAnalyzer.exe
+          generate_release_notes: true

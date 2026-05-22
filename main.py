@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from pathlib import Path
 
 import customtkinter as ctk
 
+import analyzer
+from analyzer import AnalysisError
+
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
+
+_DEFAULT_THRESHOLD = 3.0
+_MIN_THRESHOLD = 0.5
+_MAX_THRESHOLD = 30.0
 
 
 class EditorAnalyzerApp(ctk.CTk):
@@ -15,20 +23,22 @@ class EditorAnalyzerApp(ctk.CTk):
         super().__init__()
 
         self.title("EditorAnalyzer")
-        self.geometry("900x600")
-        self.minsize(700, 450)
+        self.geometry("900x640")
+        self.minsize(700, 500)
 
         self._aaf_path: Path | None = None
+        self._threshold: float = _DEFAULT_THRESHOLD
+        self._running = False
 
         self._build_ui()
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # results row expands
 
-        # — top bar: file picker —
+        # ── top bar: file picker ──────────────────────────────────────────
         top = ctk.CTkFrame(self)
-        top.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="ew")
+        top.grid(row=0, column=0, padx=16, pady=(16, 4), sticky="ew")
         top.grid_columnconfigure(1, weight=1)
 
         ctk.CTkButton(top, text="Otwórz plik AAF…", command=self._pick_file).grid(
@@ -37,26 +47,54 @@ class EditorAnalyzerApp(ctk.CTk):
         self._file_label = ctk.CTkLabel(top, text="Nie wybrano pliku", anchor="w")
         self._file_label.grid(row=0, column=1, padx=4, pady=8, sticky="ew")
 
-        ctk.CTkButton(
+        self._analyze_btn = ctk.CTkButton(
             top, text="Analizuj", fg_color="green", command=self._analyze
-        ).grid(row=0, column=2, padx=(4, 8), pady=8)
+        )
+        self._analyze_btn.grid(row=0, column=2, padx=(4, 8), pady=8)
 
-        # — results list —
+        # ── threshold row (FR-002) ────────────────────────────────────────
+        threshold_row = ctk.CTkFrame(self)
+        threshold_row.grid(row=1, column=0, padx=16, pady=(0, 4), sticky="ew")
+        threshold_row.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(threshold_row, text="Minimalna długość pauzy (s):").grid(
+            row=0, column=0, padx=(12, 8), pady=8
+        )
+        self._slider = ctk.CTkSlider(
+            threshold_row,
+            from_=_MIN_THRESHOLD,
+            to=_MAX_THRESHOLD,
+            command=self._on_slider,
+        )
+        self._slider.set(_DEFAULT_THRESHOLD)
+        self._slider.grid(row=0, column=1, padx=4, pady=8, sticky="ew")
+
+        self._threshold_entry = ctk.CTkEntry(threshold_row, width=60, justify="center")
+        self._threshold_entry.insert(0, f"{_DEFAULT_THRESHOLD:.1f}")
+        self._threshold_entry.grid(row=0, column=2, padx=(4, 12), pady=8)
+        self._threshold_entry.bind("<Return>", self._on_entry)
+        self._threshold_entry.bind("<FocusOut>", self._on_entry)
+
+        # ── progress bar (hidden until analysis starts) ───────────────────
+        self._progress = ctk.CTkProgressBar(self, mode="indeterminate")
+        # not gridded yet — shown only during analysis
+
+        # ── results ───────────────────────────────────────────────────────
         results_frame = ctk.CTkFrame(self)
-        results_frame.grid(row=1, column=0, padx=16, pady=8, sticky="nsew")
+        results_frame.grid(row=2, column=0, padx=16, pady=4, sticky="nsew")
         results_frame.grid_columnconfigure(0, weight=1)
         results_frame.grid_rowconfigure(1, weight=1)
 
-        ctk.CTkLabel(results_frame, text="Wykryte pauzy", font=ctk.CTkFont(size=14, weight="bold")).grid(
-            row=0, column=0, padx=12, pady=(10, 4), sticky="w"
-        )
+        ctk.CTkLabel(
+            results_frame, text="Wykryte pauzy", font=ctk.CTkFont(size=14, weight="bold")
+        ).grid(row=0, column=0, padx=12, pady=(10, 4), sticky="w")
 
         self._results_box = ctk.CTkTextbox(results_frame, state="disabled")
         self._results_box.grid(row=1, column=0, padx=8, pady=(0, 8), sticky="nsew")
 
-        # — bottom bar: export —
+        # ── bottom bar: export + status ───────────────────────────────────
         bottom = ctk.CTkFrame(self)
-        bottom.grid(row=2, column=0, padx=16, pady=(8, 16), sticky="ew")
+        bottom.grid(row=3, column=0, padx=16, pady=(4, 16), sticky="ew")
 
         self._export_btn = ctk.CTkButton(
             bottom, text="Eksportuj do .txt", state="disabled", command=self._export
@@ -65,6 +103,26 @@ class EditorAnalyzerApp(ctk.CTk):
 
         self._status_label = ctk.CTkLabel(bottom, text="Gotowy")
         self._status_label.pack(side="left", padx=12, pady=8)
+
+    # ── threshold controls ────────────────────────────────────────────────
+
+    def _on_slider(self, value: float) -> None:
+        self._threshold = round(value, 1)
+        self._threshold_entry.delete(0, tk.END)
+        self._threshold_entry.insert(0, f"{self._threshold:.1f}")
+
+    def _on_entry(self, _event: object = None) -> None:
+        try:
+            value = float(self._threshold_entry.get())
+            value = max(_MIN_THRESHOLD, min(_MAX_THRESHOLD, value))
+        except ValueError:
+            value = self._threshold
+        self._threshold = round(value, 1)
+        self._threshold_entry.delete(0, tk.END)
+        self._threshold_entry.insert(0, f"{self._threshold:.1f}")
+        self._slider.set(self._threshold)
+
+    # ── file picker ───────────────────────────────────────────────────────
 
     def _pick_file(self) -> None:
         path = filedialog.askopenfilename(
@@ -76,17 +134,47 @@ class EditorAnalyzerApp(ctk.CTk):
             self._file_label.configure(text=str(self._aaf_path))
             self._status_label.configure(text="Plik wczytany. Kliknij 'Analizuj'.")
 
+    # ── analysis (FR-003) ─────────────────────────────────────────────────
+
     def _analyze(self) -> None:
         if self._aaf_path is None:
             messagebox.showwarning("Brak pliku", "Najpierw wybierz plik AAF.")
             return
+        if self._running:
+            return
 
+        self._running = True
+        self._analyze_btn.configure(state="disabled")
+        self._export_btn.configure(state="disabled")
+        self._progress.grid(row=4, column=0, padx=16, pady=(0, 4), sticky="ew")
+        self._progress.start()
         self._status_label.configure(text="Analizuję…")
-        self.update_idletasks()
 
-        # TODO: wywołaj moduł analizy audio (FR-001, FR-002)
-        results: list[str] = _stub_analyze(self._aaf_path)
+        threading.Thread(
+            target=self._run_analysis,
+            args=(self._aaf_path, self._threshold),
+            daemon=True,
+        ).start()
 
+    def _run_analysis(self, aaf_path: Path, threshold_sec: float) -> None:
+        """Runs in a background thread — never touches Tk widgets directly."""
+        try:
+            results = analyzer.analyze(
+                aaf_path,
+                threshold_sec,
+                on_progress=lambda msg: self.after(0, self._set_status, msg),
+            )
+            self.after(0, self._on_analysis_done, results)
+        except AnalysisError as exc:
+            self.after(0, self._on_analysis_error, str(exc))
+        except Exception as exc:
+            self.after(0, self._on_analysis_error, f"Nieoczekiwany błąd: {exc}")
+
+    def _set_status(self, msg: str) -> None:
+        self._status_label.configure(text=msg)
+
+    def _on_analysis_done(self, results: list[str]) -> None:
+        self._stop_progress()
         self._results_box.configure(state="normal")
         self._results_box.delete("1.0", tk.END)
         if results:
@@ -94,10 +182,24 @@ class EditorAnalyzerApp(ctk.CTk):
             self._export_btn.configure(state="normal")
             self._status_label.configure(text=f"Znaleziono {len(results)} pauz.")
         else:
-            self._results_box.insert(tk.END, "Brak pauz spełniających kryteria.")
-            self._export_btn.configure(state="disabled")
-            self._status_label.configure(text="Analiza zakończona.")
+            self._results_box.insert(
+                tk.END, "Brak pauz spełniających kryteria.\nSpróbuj zmniejszyć próg."
+            )
+            self._status_label.configure(text="Analiza zakończona — brak pauz.")
         self._results_box.configure(state="disabled")
+
+    def _on_analysis_error(self, message: str) -> None:
+        self._stop_progress()
+        self._status_label.configure(text="Błąd analizy.")
+        messagebox.showerror("Błąd analizy", message)
+
+    def _stop_progress(self) -> None:
+        self._running = False
+        self._progress.stop()
+        self._progress.grid_forget()
+        self._analyze_btn.configure(state="normal")
+
+    # ── export (FR-005) ───────────────────────────────────────────────────
 
     def _export(self) -> None:
         content = self._results_box.get("1.0", tk.END).strip()
@@ -113,14 +215,6 @@ class EditorAnalyzerApp(ctk.CTk):
         if save_path:
             Path(save_path).write_text(content, encoding="utf-8")
             self._status_label.configure(text=f"Wyeksportowano: {save_path}")
-
-
-def _stub_analyze(aaf_path: Path) -> list[str]:
-    # Placeholder — zastąp wywołaniem aaf2 + librosa (FR-001, FR-002, FR-003)
-    return [
-        "00:01:23.450 – 00:01:27.810  (4.36 s)  [STUB]",
-        "00:03:05.100 – 00:03:09.220  (4.12 s)  [STUB]",
-    ]
 
 
 def main() -> None:
