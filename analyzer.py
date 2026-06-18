@@ -46,9 +46,28 @@ class AnalysisError(Exception):
 class AnalysisResult:
     """Return value of analyze() — pause lines plus summary statistics."""
     lines: list[str]
-    total_sec: float        # total sequence duration
+    total_sec: float        # analyzed sequence duration (without skipped segments)
     pause_sec: float        # sum of all detected pauses
-    audio_sec: float        # total_sec - pause_sec
+    audio_sec: float        # analyzed speech/non-pause duration
+    skipped_sec: float      # total skipped time (mapping/read errors)
+    skipped_segments: list["SkippedSegment"]
+
+
+@dataclass
+class SkippedSegment:
+    """A timeline segment that could not be analyzed, with source and reason."""
+    file_name: str
+    reason: str
+    duration_sec: float
+
+
+@dataclass
+class _TrackBuildResult:
+    """Build output for one timeline track."""
+    audio: np.ndarray | None
+    skipped_intervals: list[tuple[float, float]]
+    skipped_segments: list[SkippedSegment]
+    timeline_samples: int
 
 
 @dataclass
@@ -84,7 +103,7 @@ def analyze(
 
     _progress("Wczytuję plik AAF…")
     try:
-        y, sr, fps = _build_sequence_audio(aaf_path, _progress)
+        y, sr, fps, skipped_intervals, skipped_segments = _build_sequence_audio(aaf_path, _progress)
     except AnalysisError:
         raise
     except Exception as exc:
@@ -92,15 +111,23 @@ def analyze(
 
     _progress("Wykrywam pauzy w sekwencji…")
     pauses = _detect_pauses(y, sr, threshold_sec, top_db=top_db)
+    merged_skipped = _merge_intervals(skipped_intervals)
+    if merged_skipped:
+        pauses = _subtract_intervals(pauses, merged_skipped, min_duration=threshold_sec)
     lines = _format_pauses(pauses, fps=fps)
 
-    total_sec = len(y) / sr
+    timeline_total_sec = len(y) / sr
+    skipped_sec = sum(end - start for start, end in merged_skipped)
+    total_sec = max(0.0, timeline_total_sec - skipped_sec)
     pause_sec = sum(end - start for start, end in pauses)
+    grouped_skipped = _aggregate_skipped_segments(skipped_segments)
     return AnalysisResult(
         lines=lines,
         total_sec=total_sec,
         pause_sec=pause_sec,
-        audio_sec=total_sec - pause_sec,
+        audio_sec=max(0.0, total_sec - pause_sec),
+        skipped_sec=skipped_sec,
+        skipped_segments=grouped_skipped,
     )
 
 
@@ -111,7 +138,7 @@ def analyze(
 def _build_sequence_audio(
     aaf_path: Path,
     on_progress: Callable[[str], None],
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, int, float, list[tuple[float, float]], list[SkippedSegment]]:
     """
     Parse the AAF, walk the edited sequence, extract only the used clip ranges
     from MXF files, and return (mixed_audio, sample_rate, fps).
@@ -131,6 +158,9 @@ def _build_sequence_audio(
 
         edit_rate = _get_slot_edit_rate(main_comp)
         audio_tracks: list[np.ndarray] = []
+        all_skipped_intervals: list[tuple[float, float]] = []
+        all_skipped_segments: list[SkippedSegment] = []
+        max_timeline_samples = 0
 
         slots = list(main_comp.slots)
         for slot in slots:
@@ -138,27 +168,34 @@ def _build_sequence_audio(
             if type(seg).__name__ not in ("Sequence", "SourceClip"):
                 continue
             components = _components_of(seg)
-            track_audio = _build_track_audio(
+            track_result = _build_track_audio(
                 components, mob_by_id, edit_rate, on_progress
             )
-            if track_audio is not None:
-                audio_tracks.append(track_audio)
+            max_timeline_samples = max(max_timeline_samples, track_result.timeline_samples)
+            all_skipped_intervals.extend(track_result.skipped_intervals)
+            all_skipped_segments.extend(track_result.skipped_segments)
+            if track_result.audio is not None:
+                audio_tracks.append(track_result.audio)
 
-    if not audio_tracks:
+    if not audio_tracks and max_timeline_samples <= 0:
         raise AnalysisError(
             "Nie znaleziono ścieżek audio w sekwencji AAF.\n"
             "Sprawdź czy sekwencja zawiera zmontowane klipy audio."
         )
 
+    if not audio_tracks:
+        mixed = np.zeros(max_timeline_samples, dtype=np.float32)
+        return mixed, _TARGET_SR, edit_rate, all_skipped_intervals, all_skipped_segments
+
     # Mix all audio tracks (average) into one signal.
-    max_len = max(len(t) for t in audio_tracks)
+    max_len = max(max(len(t) for t in audio_tracks), max_timeline_samples)
     mixed = np.zeros(max_len, dtype=np.float32)
     for track in audio_tracks:
         if len(track) < max_len:
             track = np.pad(track, (0, max_len - len(track)))
         mixed += track
     mixed /= len(audio_tracks)
-    return mixed, _TARGET_SR, edit_rate
+    return mixed, _TARGET_SR, edit_rate, all_skipped_intervals, all_skipped_segments
 
 
 def _find_main_composition(mob_by_id: dict) -> object | None:
@@ -226,7 +263,7 @@ def _build_track_audio(
     mob_by_id: dict,
     edit_rate: float,
     on_progress: Callable[[str], None],
-) -> np.ndarray | None:
+) -> _TrackBuildResult:
     """
     Build a numpy audio array for one timeline slot.
 
@@ -234,10 +271,14 @@ def _build_track_audio(
     - SourceClip → resolve to MXF clip range, extract audio
     - Filler → silence of the appropriate duration
 
-    Returns None if no audio clips were found in this slot.
+    Returns track audio (or None if no clip resolved), skipped ranges, and
+    timeline length to keep global timing consistent even with failures.
     """
     chunks: list[np.ndarray] = []
     has_audio = False
+    timeline_samples = 0
+    skipped_intervals: list[tuple[float, float]] = []
+    skipped_segments: list[SkippedSegment] = []
 
     for comp in components:
         cp = _props(comp)
@@ -248,34 +289,98 @@ def _build_track_audio(
             silence_samples = int(length_frames / edit_rate * _TARGET_SR)
             if silence_samples > 0:
                 chunks.append(np.zeros(silence_samples, dtype=np.float32))
+                timeline_samples += silence_samples
 
         elif comp_type == "SourceClip":
             src_id = str(cp.get("SourceID", ""))
             src_slot = cp.get("SourceMobSlotID")
             src_start = cp.get("StartTime", 0)
             if not src_id or src_slot is None:
+                missed_sec = max(0.0, length_frames / edit_rate)
+                missed_samples = int(round(missed_sec * _TARGET_SR))
+                if missed_samples > 0:
+                    start_sec = timeline_samples / _TARGET_SR
+                    end_sec = (timeline_samples + missed_samples) / _TARGET_SR
+                    skipped_intervals.append((start_sec, end_sec))
+                    skipped_segments.append(
+                        SkippedSegment(
+                            file_name="<niezmapowany klip>",
+                            reason="Błąd mapowania: SourceClip nie zawiera pełnych danych referencyjnych.",
+                            duration_sec=end_sec - start_sec,
+                        )
+                    )
+                    chunks.append(np.zeros(missed_samples, dtype=np.float32))
+                    timeline_samples += missed_samples
                 continue
             clip_refs = _resolve_clip(mob_by_id, src_id, src_slot, src_start, length_frames)
+            if not clip_refs:
+                missed_sec = max(0.0, length_frames / edit_rate)
+                missed_samples = int(round(missed_sec * _TARGET_SR))
+                if missed_samples > 0:
+                    start_sec = timeline_samples / _TARGET_SR
+                    end_sec = (timeline_samples + missed_samples) / _TARGET_SR
+                    skipped_intervals.append((start_sec, end_sec))
+                    skipped_segments.append(
+                        SkippedSegment(
+                            file_name="<niezmapowany klip>",
+                            reason="Błąd mapowania: nie udało się powiązać SourceClip z plikiem MXF.",
+                            duration_sec=end_sec - start_sec,
+                        )
+                    )
+                    chunks.append(np.zeros(missed_samples, dtype=np.float32))
+                    timeline_samples += missed_samples
+                continue
             for ref in clip_refs:
+                expected_samples = max(0, int(round(ref.duration_sec * _TARGET_SR)))
+                if expected_samples == 0:
+                    continue
                 real_path = ref.mxf_path
                 if not real_path.exists():
                     found = _find_mxf_on_any_drive(real_path.name)
                     if found is None:
-                        raise AnalysisError(
-                            f"Nie znaleziono pliku mediów:\n{real_path.name}\n\n"
-                            "Sprawdzono wszystkie dyski w folderach Avid MediaFiles\\MXF.\n"
-                            "Upewnij się, że dysk z materiałem jest podłączony."
+                        start_sec = timeline_samples / _TARGET_SR
+                        end_sec = (timeline_samples + expected_samples) / _TARGET_SR
+                        skipped_intervals.append((start_sec, end_sec))
+                        skipped_segments.append(
+                            SkippedSegment(
+                                file_name=real_path.name,
+                                reason="Błąd mapowania: nie znaleziono pliku w lokalizacji AAF ani w Avid MediaFiles\\MXF.",
+                                duration_sec=end_sec - start_sec,
+                            )
                         )
+                        chunks.append(np.zeros(expected_samples, dtype=np.float32))
+                        timeline_samples += expected_samples
+                        continue
                     real_path = found
                 on_progress(f"Ekstrahuję klip: {real_path.name} [{ref.start_sec:.1f}s +{ref.duration_sec:.1f}s]…")
-                audio = _extract_clip_audio(real_path, ref.start_sec, ref.duration_sec)
+                try:
+                    audio = _extract_clip_audio(real_path, ref.start_sec, ref.duration_sec)
+                except AnalysisError:
+                    start_sec = timeline_samples / _TARGET_SR
+                    end_sec = (timeline_samples + expected_samples) / _TARGET_SR
+                    skipped_intervals.append((start_sec, end_sec))
+                    skipped_segments.append(
+                        SkippedSegment(
+                            file_name=real_path.name,
+                            reason="Błąd odczytu: ffmpeg nie mógł wyekstrahować audio.",
+                            duration_sec=end_sec - start_sec,
+                        )
+                    )
+                    chunks.append(np.zeros(expected_samples, dtype=np.float32))
+                    timeline_samples += expected_samples
+                    continue
+                audio = _fit_audio_length(audio, expected_samples)
+                chunks.append(audio)
+                timeline_samples += expected_samples
                 if audio.size > 0:
-                    chunks.append(audio)
                     has_audio = True
 
-    if not has_audio:
-        return None
-    return np.concatenate(chunks) if chunks else None
+    return _TrackBuildResult(
+        audio=np.concatenate(chunks) if has_audio and chunks else None,
+        skipped_intervals=skipped_intervals,
+        skipped_segments=skipped_segments,
+        timeline_samples=timeline_samples,
+    )
 
 
 def _resolve_clip(
@@ -469,6 +574,15 @@ def _extract_clip_audio(mxf_path: Path, start_sec: float, duration_sec: float) -
     return np.frombuffer(proc.stdout, dtype=np.float32).copy()
 
 
+def _fit_audio_length(audio: np.ndarray, target_samples: int) -> np.ndarray:
+    """Pad/trim extracted audio to expected timeline length."""
+    if audio.size == target_samples:
+        return audio
+    if audio.size > target_samples:
+        return audio[:target_samples]
+    return np.pad(audio, (0, target_samples - audio.size))
+
+
 # ---------------------------------------------------------------------------
 # Pause detection
 # ---------------------------------------------------------------------------
@@ -527,6 +641,69 @@ def _detect_pauses(
         pauses.append((gap_start, gap_end))
 
     return pauses
+
+
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    """Merge overlapping/adjacent intervals."""
+    if not intervals:
+        return []
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals, key=lambda x: x[0]):
+        if end <= start:
+            continue
+        if not merged or start > merged[-1][1]:
+            merged.append([start, end])
+        else:
+            merged[-1][1] = max(merged[-1][1], end)
+    return [(start, end) for start, end in merged]
+
+
+def _subtract_intervals(
+    base: list[tuple[float, float]],
+    cut: list[tuple[float, float]],
+    min_duration: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Subtract cut intervals from base intervals."""
+    if not base:
+        return []
+    cuts = _merge_intervals(cut)
+    if not cuts:
+        return [interval for interval in base if interval[1] - interval[0] >= min_duration]
+
+    result: list[tuple[float, float]] = []
+    for start, end in base:
+        if end <= start:
+            continue
+        fragments = [(start, end)]
+        for cut_start, cut_end in cuts:
+            next_fragments: list[tuple[float, float]] = []
+            for frag_start, frag_end in fragments:
+                if cut_end <= frag_start or cut_start >= frag_end:
+                    next_fragments.append((frag_start, frag_end))
+                    continue
+                if cut_start > frag_start:
+                    next_fragments.append((frag_start, cut_start))
+                if cut_end < frag_end:
+                    next_fragments.append((cut_end, frag_end))
+            fragments = next_fragments
+            if not fragments:
+                break
+        for frag_start, frag_end in fragments:
+            if frag_end - frag_start >= min_duration:
+                result.append((frag_start, frag_end))
+    return result
+
+
+def _aggregate_skipped_segments(segments: list[SkippedSegment]) -> list[SkippedSegment]:
+    """Aggregate skipped segments by file and reason."""
+    grouped: dict[tuple[str, str], float] = {}
+    for segment in segments:
+        key = (segment.file_name, segment.reason)
+        grouped[key] = grouped.get(key, 0.0) + segment.duration_sec
+    return [
+        SkippedSegment(file_name=file_name, reason=reason, duration_sec=duration_sec)
+        for (file_name, reason), duration_sec in grouped.items()
+    ]
 
 
 # ---------------------------------------------------------------------------

@@ -8,9 +8,11 @@ import numpy as np
 import pytest
 
 from analyzer import (
-    AnalysisError,
+    SkippedSegment,
+    _aggregate_skipped_segments,
     _detect_pauses,
     _format_pauses,
+    _subtract_intervals,
     _to_tc,
     _to_tc_frames,
     _url_to_path,
@@ -199,3 +201,32 @@ class TestFormatPausesWithFps:
         lines = _format_pauses([(3.0, 7.5)], fps=0.0)
         assert ":" in lines[0]
         assert "00:00:03.000" in lines[0]
+
+
+class TestSubtractIntervals:
+    def test_subtract_middle_splits_pause(self) -> None:
+        pauses = [(10.0, 20.0)]
+        skipped = [(13.0, 15.0)]
+        result = _subtract_intervals(pauses, skipped, min_duration=0.0)
+        assert result == [(10.0, 13.0), (15.0, 20.0)]
+
+    def test_subtract_applies_min_duration(self) -> None:
+        pauses = [(10.0, 20.0)]
+        skipped = [(12.0, 19.0)]
+        # Fragments: 2s and 1s -> both below threshold 2.5
+        result = _subtract_intervals(pauses, skipped, min_duration=2.5)
+        assert result == []
+
+
+class TestAggregateSkippedSegments:
+    def test_aggregates_by_file_and_reason(self) -> None:
+        aggregated = _aggregate_skipped_segments(
+            [
+                SkippedSegment("reel1.mxf", "map", 2.0),
+                SkippedSegment("reel1.mxf", "map", 3.5),
+                SkippedSegment("reel2.mxf", "read", 1.0),
+            ]
+        )
+        grouped = {(item.file_name, item.reason): item.duration_sec for item in aggregated}
+        assert grouped[("reel1.mxf", "map")] == 5.5
+        assert grouped[("reel2.mxf", "read")] == 1.0

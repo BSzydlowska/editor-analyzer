@@ -252,9 +252,22 @@ class EditorAnalyzerApp(ctk.CTk):
             text=(
                 f"Materiał: {fmt(result.total_sec)} ({result.total_sec:.1f} s)   │   "
                 f"Pauzy: {fmt(result.pause_sec)} ({result.pause_sec:.1f} s)   │   "
-                f"Dźwięk: {fmt(result.audio_sec)} ({result.audio_sec:.1f} s)"
+                f"Dźwięk: {fmt(result.audio_sec)} ({result.audio_sec:.1f} s)   │   "
+                f"Nieprzeanalizowane: {fmt(result.skipped_sec)} ({result.skipped_sec:.1f} s)"
             )
         )
+
+        if result.skipped_segments:
+            details = "\n".join(
+                f"- {segment.file_name}: {segment.duration_sec:.2f} s ({segment.reason})"
+                for segment in result.skipped_segments
+            )
+            messagebox.showwarning(
+                "Częściowa analiza",
+                "Niektóre pliki nie mogły zostać odczytane albo wystąpił błąd mapowania.\n"
+                "Wynik pauz policzono z pominięciem nieprzeanalizowanego czasu.\n\n"
+                f"Nieprzeanalizowane fragmenty:\n{details}",
+            )
 
     def _on_analysis_error(self, message: str) -> None:
         self._stop_progress()
